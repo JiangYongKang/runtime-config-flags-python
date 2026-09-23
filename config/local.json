@@ -1,0 +1,35 @@
+{
+  "sources": [
+    {
+      "source_id": "defaults",
+      "priority": 10,
+      "settings": {
+        "max_connections": 100,
+        "request_timeout_ms": 3000,
+        "sample_rate": 0.1,
+        "log_level": "INFO"
+      },
+      "flags": {
+        "new_checkout": {
+          "enabled": false,
+          "percentage": 0,
+          "overrides": {}
+        }
+      }
+    },
+    {
+      "source_id": "local-override",
+      "priority": 50,
+      "settings": {
+        "log_level": "DEBUG"
+      },
+      "flags": {
+        "new_checkout": {
+          "enabled": true,
+          "percentage": 50,
+          "overrides": {"user-42": true, "user-7": false}
+        }
+      }
+    }
+  ]
+}
