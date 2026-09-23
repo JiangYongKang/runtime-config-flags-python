@@ -1,0 +1,24 @@
+{
+  "config": {
+    "max_connections": 200,
+    "timeout_ms": 3000,
+    "sample_rate": 0.5,
+    "enable_cache": true,
+    "log_level": "info"
+  },
+  "features": {
+    "new_checkout": {
+      "default_on": false,
+      "percentage": 25,
+      "overrides": {
+        "tester@example.com": true,
+        "blocked@example.com": false
+      },
+      "salt": "checkout-2026"
+    },
+    "legacy_mode": {
+      "default_on": true,
+      "percentage": 0
+    }
+  }
+}

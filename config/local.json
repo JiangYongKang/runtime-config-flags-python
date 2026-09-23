@@ -1,0 +1,13 @@
+{
+  "config": {
+    "timeout_ms": 1500,
+    "log_level": "debug"
+  },
+  "features": {
+    "beta_search": {
+      "default_on": false,
+      "percentage": 50,
+      "salt": "search-canary"
+    }
+  }
+}
