@@ -7,9 +7,14 @@
   GET  /flags                        当前开关清单
   GET  /flags/{flag}?subject=...      开关判定（返回完整依据）
   POST /reload                       热更新（可选 sources / expected_version）
+  GET  /history                      保留范围内的历史版本号列表
+  GET  /history/{version}            某个历史版本的完整配置+开关
+  POST /rollback                     一键回滚（体：{"version": N}）
+  GET  /audit                        变更留痕（成功与被拒，含具体拒绝原因）
 
 错误统一转换为带 ``error_code`` 的 JSON：
-  NO_SNAPSHOT -> 503；VERSION_CONFLICT -> 409；其余配置类错误 -> 422。
+  NO_SNAPSHOT -> 503；VERSION_CONFLICT -> 409；
+  VERSION_NOT_RETAINED -> 410；其余配置类错误 -> 422。
 """
 
 from __future__ import annotations
@@ -24,6 +29,7 @@ from app.service import RuntimeConfigService
 _STATUS_BY_CODE = {
     ErrorCode.NO_SNAPSHOT: 503,
     ErrorCode.VERSION_CONFLICT: 409,
+    ErrorCode.VERSION_NOT_RETAINED: 410,
 }
 
 
@@ -32,6 +38,12 @@ class ReloadRequest(BaseModel):
 
     sources: list[str] | None = None
     expected_version: int | None = None
+
+
+class RollbackRequest(BaseModel):
+    """/rollback 请求体：目标历史版本号。"""
+
+    version: int
 
 
 def create_app(service: RuntimeConfigService | None = None) -> FastAPI:
@@ -79,6 +91,33 @@ def create_app(service: RuntimeConfigService | None = None) -> FastAPI:
             body.sources, expected_version=body.expected_version
         )
         return {"status": "reloaded", "snapshot": snap.to_public_dict()}
+
+    @app.get("/history")
+    def list_history() -> dict:
+        svc = app.state.service
+        return {
+            "current_version": svc.version(),
+            "retained_versions": svc.history_versions(),
+        }
+
+    @app.get("/history/{version}")
+    def get_history(version: int) -> dict:
+        snap = app.state.service.history_snapshot(version)
+        return {"snapshot": snap.to_public_dict()}
+
+    @app.post("/rollback")
+    def rollback(body: RollbackRequest) -> dict:
+        snap = app.state.service.rollback(body.version)
+        return {
+            "status": "rolled_back",
+            "rolled_back_from": body.version,
+            "snapshot": snap.to_public_dict(),
+        }
+
+    @app.get("/audit")
+    def list_audit() -> dict:
+        records = app.state.service.audit_records()
+        return {"records": [rec.to_dict() for rec in records]}
 
     return app
 

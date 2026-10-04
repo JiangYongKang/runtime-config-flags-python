@@ -1,6 +1,7 @@
 # 运行时配置与特性开关服务（Python / FastAPI）
 
-在不重启服务的前提下，提供**多来源配置合并、原子热更新、按主体灰度的特性开关**。
+在不重启服务的前提下，提供**多来源配置合并、原子热更新、按主体灰度的特性开关**，
+以及**变更留痕、历史版本查询与一键回滚**。
 配置变更、灰度判定与运行状态在本地完全可复现；任何无效输入都以**稳定可区分的
 错误码**显式拒绝，绝不静默采用。
 
@@ -13,10 +14,11 @@ app/
   config.py    # 多源加载、校验、合并（默认字段规格在此登记）
   store.py     # 线程安全原子快照存储（引用替换 + CAS）
   flags.py     # 稳定桶值与灰度/覆盖判定（sha256）
-  service.py   # 门面：bootstrap / reload / get / evaluate_flag
+  history.py   # 变更留痕 + 有界历史版本保留（ChangeRecord / HistoryKeeper）
+  service.py   # 门面：bootstrap / reload / rollback / history / audit / evaluate
   api.py       # FastAPI 路由与结构化错误响应
 config/        # 本地示例配置（base.json 低优先级，local.json 高优先级）
-tests/         # pytest：校验、灰度边界、热更回滚、并发、跨进程确定性
+tests/         # pytest：校验、灰度边界、热更回滚、留痕、并发、跨进程确定性
 main.py        # ASGI 入口（uv main:app）
 ```
 
@@ -63,6 +65,7 @@ config/local.json  → 高优先级（同名字段覆盖 base）
 | `value_out_of_range` | int/float 超出规格闭区间 |
 | `source_conflict` | 同一字段在不同来源中以**不兼容类型**出现（即使低优先级值会被覆盖也拒绝，避免脏来源被静默吞掉） |
 | `illegal_percentage` | 灰度比例不是 0..100 的整数（含 bool、浮点、字符串） |
+| `version_not_retained` | 查询/回滚的历史版本已不在保留范围内 |
 
 ## 二、启动行为（确定且可解释）
 
@@ -77,18 +80,55 @@ config/local.json  → 高优先级（同名字段覆盖 base）
 `POST /reload`（或 `service.reload()`）：
 
 1. 从来源列表重新读取，在**临时数据**上完成全部加载与校验，构建新的不可变快照；
-2. 校验通过后，基于当前版本号做 **CAS（compare-and-set）发布**——底层只是一次
-   持锁引用替换；
+2. 校验通过后发布——底层只是一次持锁引用替换；
 3. **原子可见**：任一请求拿到的要么是完整旧版本、要么是完整新版本，绝不会读到
    半个配置。`Snapshot` 为 frozen dataclass，内部映射以 `MappingProxyType` 冻结；
 4. **无效更新不改变当前状态**：校验失败时根本不会触碰存储（天然回滚），错误码、
-   字段路径、来源随 422 响应与日志返回；
-5. **并发更新**：`expected_version` 过期时返回 409 `version_conflict`，当前状态
-   不变，由调用方重试；不带 `expected_version` 时无条件发布，版本严格 +1。
+   字段路径、来源随 422 响应与日志返回；携带新 `sources` 的更新若被拒绝，
+   来源列表也不会被替换，后续更新仍用原来的来源正常发布；
+5. **并发更新**：所有 reload/rollback 在同一把发布锁下严格串行，版本号在锁内
+   分配。不带 `expected_version` 的合法热更**必然发布成功**并拿到递增新版本，
+   不会因并发大面积失败；带 `expected_version` 时做 CAS，过期返回 409
+   `version_conflict`，当前状态不变，由调用方重试。
 
-版本号从 1 开始，每次成功热更 +1，单调不跳号。
+版本号从 1 开始，每次成功发布（热更或回滚）+1，单调递增、不复用、不跳号。
 
-## 四、特性开关判定规则
+## 四、变更留痕（audit）
+
+每次热更/回滚，**无论成功还是被拒**，都会追加一条不可变留痕（`ChangeRecord`）：
+
+```json
+{ "seq": 4, "kind": "reload", "outcome": "rejected", "version": null,
+  "reason": "value_out_of_range: ...", "error_code": "value_out_of_range",
+  "detail": { "error": {...}, "sources": [...] } }
+```
+
+- `kind`：`bootstrap` / `reload` / `rollback`；`outcome`：`published` / `rejected`；
+- **被拒原因可区分**：`error_code` 是具体错误码（如 `value_out_of_range`、
+  `source_not_found`、`version_conflict`、`version_not_retained`），而非笼统失败；
+- 被拒的更新不会让生效配置、开关、版本发生任何变化；
+- 留痕条数有上限：`RuntimeConfigService(audit_limit=...)`，默认 200；
+  超出后**淘汰最旧**，淘汰只影响可查的留痕范围，不影响当前生效版本；
+- 查询：`GET /audit` 或 `service.audit_records()`。
+
+## 五、历史版本查询与一键回滚
+
+- **历史保留**：每个成功发布的版本（含 bootstrap、热更、回滚产生的新版本）都会
+  保留完整快照。保留条数可配置：`RuntimeConfigService(history_limit=...)`，
+  默认 50；超出后淘汰最旧，**淘汰不影响当前生效版本**（生效快照由存储独立持有），
+  只是该版本不再可查、不可作为回滚目标。
+- **查询**：`GET /history` 列出保留范围内的版本号；`GET /history/{version}`
+  返回该版本当时完整的配置 + 开关（同一快照，自洽）。
+- **回滚**：`POST /rollback {"version": N}`（或 `service.rollback(N)`）把保留范围
+  内的历史版本**重新发布**为当前生效版本：
+  - 产生**全新版本号**（当前版本 +1），继续单调递增，不复用旧号、不跳号；
+  - 新版本的配置与开关和目标历史版本完全一致，并追加一条“由历史版本 N 回滚”
+    的合并依据；
+  - 目标版本不在保留范围时返回 410 `version_not_retained`（可区分），
+    **当前生效状态保持不变**，且留下被拒留痕；
+  - 回滚与普通热更共用同一把发布锁，严格串行，不会各写各的、互相覆盖。
+
+## 六、特性开关判定规则
 
 对开关 `flag` 与主体 `subject`，依据当前快照中的规则依次判定：
 
@@ -121,7 +161,7 @@ config/local.json  → 高优先级（同名字段覆盖 base）
   "reason": "gray_miss", "percentage": 25, "bucket": 65, "version": 3 }
 ```
 
-## 五、HTTP 接口
+## 七、HTTP 接口
 
 | 方法/路径 | 说明 |
 | --- | --- |
@@ -131,6 +171,10 @@ config/local.json  → 高优先级（同名字段覆盖 base）
 | `GET /flags` | 当前开关清单 |
 | `GET /flags/{flag}?subject=...` | 开关判定（返回完整依据） |
 | `POST /reload` | 热更新，体：`{"sources": [...], "expected_version": 1}`（均可选） |
+| `GET /history` | 保留范围内的历史版本号列表 + 当前版本 |
+| `GET /history/{version}` | 某个历史版本的完整配置 + 开关（不在保留范围 → 410） |
+| `POST /rollback` | 一键回滚，体：`{"version": N}`，重新发布为全新版本 |
+| `GET /audit` | 变更留痕（成功与被拒，含具体拒绝原因） |
 
 错误响应统一为：HTTP 422（配置类）/ 409（版本冲突）/ 503（无快照），体：
 
@@ -139,15 +183,16 @@ config/local.json  → 高优先级（同名字段覆盖 base）
   "path": "config.timeout_ms", "source": "config/local.json", "context": {...} }
 ```
 
-## 六、本地验证方法
+## 八、本地验证方法
 
 ```bash
 # 1) 安装依赖（Python 3.14 + uv）
 uv sync
 
-# 2) 跑全部单测（含并发读写、无效更新回滚、0%/100%/中间灰度、重复判定稳定性、
-#    跨进程确定性；日志打印输入配置、生效版本与判定依据）
-uv run pytest -s
+# 2) 跑全部单测（含并发读写、无效更新回滚、留痕与淘汰、历史查询、一键回滚、
+#    回滚与并发热更、0%/100%/中间灰度、重复判定稳定性、跨进程确定性；
+#    日志实时打印每次操作的输入配置、最终生效版本与被拒原因）
+uv run pytest
 
 # 3) 启动服务（默认读取 config/base.json + config/local.json）
 uv run uvicorn main:app --reload
@@ -159,12 +204,35 @@ curl -s "localhost:8000/flags/new_ui?subject=alice" | jq .
 curl -s -X POST localhost:8000/reload \
   -H 'content-type: application/json' \
   -d '{"sources":["config/base.json","config/local.json"],"expected_version":1}'
+
+# 5) 留痕 / 历史 / 回滚
+curl -s localhost:8000/audit | jq .          # 变更留痕（含被拒原因）
+curl -s localhost:8000/history | jq .        # 保留范围内的历史版本
+curl -s localhost:8000/history/1 | jq .      # 历史版本 1 的完整配置+开关
+curl -s -X POST localhost:8000/rollback \
+  -H 'content-type: application/json' -d '{"version":1}'   # 回滚并发布全新版本
 ```
 
 验证“无效更新回滚”：把 `config/local.json` 的 `timeout_ms` 改成 `99999999`
 后 POST `/reload`，得到 422 `value_out_of_range`，而 `/health` 版本号与
-`/config/timeout_ms` 保持不变。
+`/config/timeout_ms` 保持不变，且 `GET /audit` 能看到这条被拒留痕。
 
-测试日志（`-s`）中每个用例都会打印：
+验证“一键回滚”：热更若干次后 `POST /rollback {"version":1}`，响应中
+`snapshot.version` 为全新递增版本号，配置内容回到历史版本 1；
+`POST /rollback {"version":999}` 得到 410 `version_not_retained`，
+当前生效版本不变。
+
+测试日志中每个用例都会打印：
 `[测试输入配置] ...`、`[测试生效版本] version=N`、`[测试合并依据] ...`、
-`[判定依据] ...`、`[拒绝原因] code=...`，失败原因可区分、可复现。
+`[判定依据] ...`、`[留痕] ...`、`[拒绝原因] code=...`，失败原因可区分、可复现。
+
+## 九、与既有能力的兼容关系
+
+- 留痕、历史保留与回滚是**叠加层**：多源合并、字段校验、灰度判定、原子发布的
+  语义完全不变，既有全部用例不回归；
+- 历史版本与留痕都是**内存态、有界**的，服务重启后从 bootstrap 重新累计，
+  不影响启动与 strict 语义；
+- 回滚复用与热更相同的不可变快照发布路径，单请求一致性（版本号、配置、开关
+  判定来自同一次生效结果）在回滚后同样成立；
+- `expected_version` 的 CAS 语义保留；变化仅在于不带期望版本的热更现在
+  在发布锁内取号，合法内容必然成功，不再因并发返回 `version_conflict`。
