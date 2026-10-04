@@ -7,9 +7,14 @@
   GET  /flags                        当前开关清单
   GET  /flags/{flag}?subject=...      开关判定（返回完整依据）
   POST /reload                       热更新（可选 sources / expected_version）
+  GET  /changes                      变更留痕（成功/被拒，原因可区分，有界）
+  GET  /history                      仍在保留范围内的历史版本号列表
+  GET  /history/{version}            某个历史版本的完整配置与开关
+  POST /rollback                     一键回滚（target_version，可选 expected_version）
 
 错误统一转换为带 ``error_code`` 的 JSON：
-  NO_SNAPSHOT -> 503；VERSION_CONFLICT -> 409；其余配置类错误 -> 422。
+  NO_SNAPSHOT -> 503；VERSION_CONFLICT -> 409；
+  HISTORY_VERSION_NOT_FOUND -> 404；其余配置类错误 -> 422。
 """
 
 from __future__ import annotations
@@ -24,6 +29,7 @@ from app.service import RuntimeConfigService
 _STATUS_BY_CODE = {
     ErrorCode.NO_SNAPSHOT: 503,
     ErrorCode.VERSION_CONFLICT: 409,
+    ErrorCode.HISTORY_VERSION_NOT_FOUND: 404,
 }
 
 
@@ -34,12 +40,19 @@ class ReloadRequest(BaseModel):
     expected_version: int | None = None
 
 
+class RollbackRequest(BaseModel):
+    """/rollback 请求体。"""
+
+    target_version: int
+    expected_version: int | None = None
+
+
 def create_app(service: RuntimeConfigService | None = None) -> FastAPI:
     """构造 FastAPI 应用并注入服务实例。"""
     app = FastAPI(
         title="runtime-config-flags",
-        version="0.1.0",
-        description="运行时配置与特性开关服务（多源合并 / 原子热更新 / 灰度判定）",
+        version="0.10.0",
+        description="运行时配置与特性开关服务（多源合并 / 原子热更新 / 灰度判定 / 变更留痕 / 历史回滚）",
     )
     app.state.service = service
 
@@ -79,6 +92,45 @@ def create_app(service: RuntimeConfigService | None = None) -> FastAPI:
             body.sources, expected_version=body.expected_version
         )
         return {"status": "reloaded", "snapshot": snap.to_public_dict()}
+
+    # ------------------------------------------------------------------ #
+    # 变更留痕 / 历史版本 / 回滚
+    # ------------------------------------------------------------------ #
+    @app.get("/changes")
+    def list_changes() -> dict:
+        svc = app.state.service
+        entries = svc.list_changes()
+        return {
+            "limit": svc.audit_limit,
+            "total": len(entries),
+            "changes": [e.to_dict() for e in entries],
+        }
+
+    @app.get("/history")
+    def list_history() -> dict:
+        svc = app.state.service
+        return {
+            "limit": svc.history_limit,
+            "versions": svc.list_history_versions(),
+            "current_version": svc.try_current_version(),
+        }
+
+    @app.get("/history/{version}")
+    def get_history(version: int) -> dict:
+        snap = app.state.service.historical_snapshot(version)
+        return {"snapshot": snap.to_public_dict()}
+
+    @app.post("/rollback")
+    def rollback(body: RollbackRequest) -> dict:
+        svc = app.state.service
+        snap = svc.rollback(
+            body.target_version, expected_version=body.expected_version
+        )
+        return {
+            "status": "rolled_back",
+            "rolled_back_from": body.target_version,
+            "snapshot": snap.to_public_dict(),
+        }
 
     return app
 

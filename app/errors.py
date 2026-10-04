@@ -36,6 +36,9 @@ class ErrorCode(str, Enum):
     UPDATE_REJECTED = "update_rejected"
     VERSION_CONFLICT = "version_conflict"
 
+    # —— 历史版本 / 回滚 ——
+    HISTORY_VERSION_NOT_FOUND = "history_version_not_found"
+
 
 class ConfigError(Exception):
     """带错误码、来源路径与上下文的配置异常。
